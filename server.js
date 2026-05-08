@@ -16,41 +16,97 @@ const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
 });
 
-// ─── Persistent storage ───────────────────────────────────────────────────
+// ─── IMPROVED PERSISTENT STORAGE ──────────────────────────────────────
 const DATA_FILE = path.join(__dirname, 'data.json');
+const BACKUP_FILE = path.join(__dirname, 'data.backup.json');
+
+// ✅ AUTO-SAVE interval - saves every 30 seconds regardless
+let saveInterval = null;
 
 function loadData() {
   try {
     if (fs.existsSync(DATA_FILE)) {
       const raw = fs.readFileSync(DATA_FILE, 'utf8');
       const parsed = JSON.parse(raw);
+      console.log(`✅ Loaded ${Object.keys(parsed.users || {}).length} users from disk`);
       return { users: parsed.users || {}, sessions: parsed.sessions || {} };
     }
   } catch (e) {
-    console.error('Failed to load data.json:', e.message);
+    console.error('⚠️ Failed to load data.json:', e.message);
+    // Try backup
+    try {
+      if (fs.existsSync(BACKUP_FILE)) {
+        const raw = fs.readFileSync(BACKUP_FILE, 'utf8');
+        const parsed = JSON.parse(raw);
+        console.log(`✅ Recovered from backup with ${Object.keys(parsed.users || {}).length} users`);
+        return { users: parsed.users || {}, sessions: parsed.sessions || {} };
+      }
+    } catch (e2) {
+      console.error('⚠️ Backup also failed:', e2.message);
+    }
   }
   return { users: {}, sessions: {} };
 }
 
 function saveData() {
   try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify({ users, sessions }, null, 2), 'utf8');
+    const data = { users, sessions, lastSaved: new Date().toISOString() };
+    
+    // Write to file atomically
+    const tempFile = DATA_FILE + '.tmp';
+    fs.writeFileSync(tempFile, JSON.stringify(data, null, 2), 'utf8');
+    
+    // Backup old file
+    if (fs.existsSync(DATA_FILE)) {
+      fs.copyFileSync(DATA_FILE, BACKUP_FILE);
+    }
+    
+    // Replace with new file
+    fs.renameSync(tempFile, DATA_FILE);
+    
+    console.log(`💾 Saved ${Object.keys(users).length} users to disk at ${new Date().toLocaleTimeString()}`);
+    return true;
   } catch (e) {
-    console.error('Failed to save data.json:', e.message);
+    console.error('❌ CRITICAL: Failed to save data.json:', e.message);
+    return false;
   }
+}
+
+// ✅ AUTO-SAVE every 30 seconds
+function startAutoSave() {
+  if (saveInterval) clearInterval(saveInterval);
+  
+  saveInterval = setInterval(() => {
+    console.log('🔄 Auto-saving...');
+    saveData();
+  }, 30000); // 30 seconds
 }
 
 const { users, sessions } = loadData();
 const games = {};
 const waitingPlayers = { normal: [], phoenix: [] };
 
-console.log(`Loaded ${Object.keys(users).length} users from storage.`);
+// Start auto-save immediately
+startAutoSave();
+
+// ✅ Save on graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('📤 Shutting down gracefully...');
+  saveData();
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('📤 Shutting down gracefully...');
+  saveData();
+  process.exit(0);
+});
+
+console.log(`✅ Loaded ${Object.keys(users).length} users from storage.`);
 
 // ─── Time format helpers ──────────────────────────────────────────────────
-// Maps timer seconds+increment to a specific rating key
 function getTimeKey(seconds, increment) {
   const inc = increment || 0;
-  // Normal chess formats
   if (seconds === 30  && inc === 0) return { mode: 'normal', cat: 'bullet_30s' };
   if (seconds === 60  && inc === 0) return { mode: 'normal', cat: 'bullet_1m' };
   if (seconds === 120 && inc === 0) return { mode: 'normal', cat: 'bullet_2m' };
@@ -63,7 +119,7 @@ function getTimeKey(seconds, increment) {
   if (seconds === 900 && inc === 0) return { mode: 'normal', cat: 'rapid_15m' };
   if (seconds === 900 && inc === 5) return { mode: 'normal', cat: 'rapid_15p5' };
   if (seconds === 1800 && inc === 0) return { mode: 'normal', cat: 'classical_30m' };
-  return { mode: 'normal', cat: 'blitz_5m' }; // default
+  return { mode: 'normal', cat: 'blitz_5m' };
 }
 
 function getPhoenixTimeKey(seconds, increment) {
@@ -76,7 +132,7 @@ function getPhoenixTimeKey(seconds, increment) {
   if (seconds === 900 && inc === 0) return { mode: 'phoenix', cat: 'rapid_15m' };
   if (seconds === 900 && inc === 5) return { mode: 'phoenix', cat: 'rapid_15p5' };
   if (seconds === 1800 && inc === 0) return { mode: 'phoenix', cat: 'classical_30m' };
-  return { mode: 'phoenix', cat: 'blitz_5m' }; // default
+  return { mode: 'phoenix', cat: 'blitz_5m' };
 }
 
 function getCategory(seconds, increment) {
@@ -102,7 +158,6 @@ function calcElo(playerRating, opponentRating, result) {
   return Math.round(playerRating + K * (result - expected));
 }
 
-// ─── Default ratings for all time formats ────────────────────────────────
 function defaultNormalRatings() {
   return {
     bullet_30s: 400, bullet_1m: 400, bullet_2m: 400, bullet_2p3: 400,
@@ -188,13 +243,15 @@ app.post('/auth/register', (req, res) => {
   users[username.toLowerCase()] = user;
   const token = generateToken();
   sessions[token] = username.toLowerCase();
+  
+  // ✅ SAVE IMMEDIATELY after registration
   saveData();
+  
   res.json({ token, user: sanitizeUser(user) });
 });
 
 app.post('/auth/login', (req, res) => {
   const { username, password } = req.body;
-  // Allow login by username, email, or phone
   let user = users[username?.toLowerCase()];
   if (!user) {
     user = Object.values(users).find(u =>
@@ -207,14 +264,20 @@ app.post('/auth/login', (req, res) => {
   }
   const token = generateToken();
   sessions[token] = user.username.toLowerCase();
+  
+  // ✅ SAVE immediately after login
   saveData();
+  
   res.json({ token, user: sanitizeUser(user) });
 });
 
 app.post('/auth/logout', authMiddleware, (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   delete sessions[token];
+  
+  // ✅ SAVE immediately after logout
   saveData();
+  
   res.json({ success: true });
 });
 
@@ -222,7 +285,6 @@ app.post('/auth/logout', authMiddleware, (req, res) => {
 app.get('/profile/me', authMiddleware, (req, res) => {
   const user = users[req.username];
   if (!user) return res.status(404).json({ error: 'User not found' });
-  // Make sure old accounts have new rating fields
   if (!user.ratings.normal.bullet_30s) {
     user.ratings.normal = { ...defaultNormalRatings(), ...user.ratings.normal };
     user.peakRatings.normal = { ...defaultNormalRatings(), ...user.peakRatings.normal };
@@ -251,8 +313,11 @@ app.patch('/profile/me', authMiddleware, (req, res) => {
   if (country !== undefined) user.country = country.slice(0, 50);
   if (aim !== undefined) user.aim = aim.slice(0, 100);
   if (flair !== undefined) user.flair = flair.slice(0, 10);
-  if (profilePic !== undefined) user.profilePic = profilePic; // base64 string
+  if (profilePic !== undefined) user.profilePic = profilePic;
+  
+  // ✅ SAVE immediately after profile update
   saveData();
+  
   res.json(sanitizeUser(user));
 });
 
@@ -283,12 +348,26 @@ app.get('/history/:username', (req, res) => {
   res.json(user.matchHistory.slice(-100).reverse());
 });
 
+// ✅ NEW: Export match history as JSON (for analysis tools)
+app.get('/history/:username/export', (req, res) => {
+  const user = users[req.params.username.toLowerCase()];
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  res.json({
+    username: user.username,
+    exportDate: new Date().toISOString(),
+    totalGames: user.matchHistory.length,
+    matches: user.matchHistory
+  });
+});
+
 // ─── Health check ─────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
     status: 'Phoenix Chess Server running ✅',
     players: Object.keys(users).length,
     activeGames: Object.keys(games).length,
+    dataPersisted: fs.existsSync(DATA_FILE),
+    lastSave: fs.existsSync(DATA_FILE) ? fs.statSync(DATA_FILE).mtime : null,
   });
 });
 
@@ -319,6 +398,9 @@ function createGame(socket1, socket2, mode, timerSeconds, increment) {
     timers: { w: timerSeconds, b: timerSeconds },
     timerInterval: null,
     started: false,
+    // ✅ NEW: Store full move list for PGN export
+    moves: [],
+    pgn: '',
   };
 
   return {
@@ -368,8 +450,29 @@ function endGame(gameId, result, reason, winnerColor, loserColor) {
       u2.stats[mode].draws++;
       const rc1 = u1.ratings[mode][cat] - r1;
       const rc2 = u2.ratings[mode][cat] - r2;
-      u1.matchHistory.push({ gameId, mode, cat, result: 'draw', opponent: u2.username, ratingChange: rc1, date: Date.now() });
-      u2.matchHistory.push({ gameId, mode, cat, result: 'draw', opponent: u1.username, ratingChange: rc2, date: Date.now() });
+      
+      // ✅ Store full match record with PGN
+      const matchRecord = {
+        gameId,
+        mode,
+        cat,
+        result: 'draw',
+        opponent: u2.username,
+        ratingChange: rc1,
+        date: Date.now(),
+        pgn: generatePGN(game, 'draw'),
+        moves: game.chess.history({ verbose: true }),
+      };
+      
+      u1.matchHistory.push(matchRecord);
+      u2.matchHistory.push({
+        ...matchRecord,
+        opponent: u1.username,
+        ratingChange: rc2,
+        pgn: generatePGN(game, 'draw'),
+      });
+      
+      // ✅ SAVE immediately after game ends
       saveData();
     }
   } else if (winnerColor && loserColor) {
@@ -377,6 +480,7 @@ function endGame(gameId, result, reason, winnerColor, loserColor) {
     const losUN = game.usernames[loserColor];
     const winner = winUN ? users[winUN] : null;
     const loser  = losUN ? users[losUN] : null;
+    
     if (winner && loser) {
       const wr = winner.ratings[mode][cat] || 400;
       const lr = loser.ratings[mode][cat]  || 400;
@@ -389,13 +493,66 @@ function endGame(gameId, result, reason, winnerColor, loserColor) {
       loser.winStreak = 0;
       winner.bestWinStreak = Math.max(winner.bestWinStreak || 0, winner.winStreak);
       const rc = winner.ratings[mode][cat] - wr;
-      winner.matchHistory.push({ gameId, mode, cat, result: 'win',  opponent: loser.username,  ratingChange: rc,   date: Date.now() });
-      loser.matchHistory.push({  gameId, mode, cat, result: 'loss', opponent: winner.username, ratingChange: -rc,  date: Date.now() });
+      
+      // ✅ Store full match record with PGN
+      winner.matchHistory.push({
+        gameId,
+        mode,
+        cat,
+        result: 'win',
+        opponent: loser.username,
+        ratingChange: rc,
+        date: Date.now(),
+        pgn: generatePGN(game, 'win'),
+        moves: game.chess.history({ verbose: true }),
+      });
+      
+      loser.matchHistory.push({
+        gameId,
+        mode,
+        cat,
+        result: 'loss',
+        opponent: winner.username,
+        ratingChange: -rc,
+        date: Date.now(),
+        pgn: generatePGN(game, 'loss'),
+        moves: game.chess.history({ verbose: true }),
+      });
+      
+      // ✅ SAVE immediately after game ends
       saveData();
     }
   }
 
   delete games[gameId];
+}
+
+// ✅ NEW: PGN generation for game export
+function generatePGN(game, result) {
+  const date = new Date();
+  const dateStr = date.toISOString().split('T')[0];
+  
+  let pgnResult = '*';
+  if (result === 'win') pgnResult = '1-0';
+  else if (result === 'loss') pgnResult = '0-1';
+  else if (result === 'draw') pgnResult = '1/2-1/2';
+  
+  const moves = game.chess.history({ verbose: true })
+    .map((m, i) => {
+      if (i % 2 === 0) return `${Math.floor(i/2) + 1}. ${m.san}`;
+      return m.san;
+    })
+    .join(' ');
+  
+  return `[Event "Phoenix Chess Game"]
+[Site "phoenix-chess.com"]
+[Date "${dateStr}"]
+[White "${game.usernames.w}"]
+[Black "${game.usernames.b}"]
+[Result "${pgnResult}"]
+[TimeControl "${game.timerSeconds}+${game.increment}"]
+
+${moves} ${pgnResult}`;
 }
 
 // ─── Socket.io ────────────────────────────────────────────────────────────
@@ -517,4 +674,8 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`🚀 Phoenix Chess Server running on port ${PORT}`);
+  console.log(`💾 Data persisted to: ${DATA_FILE}`);
+  console.log(`📊 Auto-save enabled every 30 seconds`);
+});
