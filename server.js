@@ -226,6 +226,34 @@ function sanitizeUser(user) {
   return safe;
 }
 
+// ✅ PGN generation for game export
+function generatePGN(game, result) {
+  const date = new Date();
+  const dateStr = date.toISOString().split('T')[0];
+  
+  let pgnResult = '*';
+  if (result === 'win') pgnResult = '1-0';
+  else if (result === 'loss') pgnResult = '0-1';
+  else if (result === 'draw') pgnResult = '1/2-1/2';
+  
+  const moves = game.chess.history({ verbose: true })
+    .map((m, i) => {
+      if (i % 2 === 0) return `${Math.floor(i/2) + 1}. ${m.san}`;
+      return m.san;
+    })
+    .join(' ');
+  
+  return `[Event "Phoenix Chess Game"]
+[Site "phoenix-chess.com"]
+[Date "${dateStr}"]
+[White "${game.usernames.w}"]
+[Black "${game.usernames.b}"]
+[Result "${pgnResult}"]
+[TimeControl "${game.timerSeconds}+${game.increment}"]
+
+${moves} ${pgnResult}`;
+}
+
 // ─── Auth routes ──────────────────────────────────────────────────────────
 app.post('/auth/register', (req, res) => {
   const { username, password, email, phone } = req.body;
@@ -252,6 +280,7 @@ app.post('/auth/register', (req, res) => {
 
 app.post('/auth/login', (req, res) => {
   const { username, password } = req.body;
+  // Allow login by username, email, or phone
   let user = users[username?.toLowerCase()];
   if (!user) {
     user = Object.values(users).find(u =>
@@ -313,7 +342,7 @@ app.patch('/profile/me', authMiddleware, (req, res) => {
   if (country !== undefined) user.country = country.slice(0, 50);
   if (aim !== undefined) user.aim = aim.slice(0, 100);
   if (flair !== undefined) user.flair = flair.slice(0, 10);
-  if (profilePic !== undefined) user.profilePic = profilePic;
+  if (profilePic !== undefined) user.profilePic = profilePic; // base64 string
   
   // ✅ SAVE immediately after profile update
   saveData();
@@ -360,6 +389,36 @@ app.get('/history/:username/export', (req, res) => {
   });
 });
 
+// ✅ NEW: Get single game analysis
+app.get('/game/:gameId', (req, res) => {
+  const { gameId } = req.params;
+  
+  for (const user of Object.values(users)) {
+    const game = user.matchHistory.find(m => m.gameId === gameId);
+    if (game) {
+      return res.json(game);
+    }
+  }
+  
+  res.status(404).json({ error: 'Game not found' });
+});
+
+// ✅ NEW: Update game analysis notes
+app.patch('/game/:gameId/notes', authMiddleware, (req, res) => {
+  const { gameId } = req.params;
+  const { notes } = req.body;
+  
+  const user = users[req.username];
+  const game = user.matchHistory.find(m => m.gameId === gameId);
+  
+  if (!game) return res.status(404).json({ error: 'Game not found' });
+  
+  game.notes = { ...game.notes, ...notes };
+  saveData();
+  
+  res.json({ success: true, notes: game.notes });
+});
+
 // ─── Health check ─────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
@@ -398,9 +457,6 @@ function createGame(socket1, socket2, mode, timerSeconds, increment) {
     timers: { w: timerSeconds, b: timerSeconds },
     timerInterval: null,
     started: false,
-    // ✅ NEW: Store full move list for PGN export
-    moves: [],
-    pgn: '',
   };
 
   return {
@@ -436,9 +492,11 @@ function endGame(gameId, result, reason, winnerColor, loserColor) {
   const mode = game.mode;
   const { cat } = game.timeKey;
 
+  // DRAW or STALEMATE
   if (reason === 'Draw' || (!winnerColor && !loserColor)) {
     const u1 = game.usernames.w ? users[game.usernames.w] : null;
     const u2 = game.usernames.b ? users[game.usernames.b] : null;
+    
     if (u1 && u2) {
       const r1 = u1.ratings[mode][cat] || 400;
       const r2 = u2.ratings[mode][cat] || 400;
@@ -448,11 +506,13 @@ function endGame(gameId, result, reason, winnerColor, loserColor) {
       u2.peakRatings[mode][cat] = Math.max(u2.peakRatings[mode][cat] || 400, u2.ratings[mode][cat]);
       u1.stats[mode].draws++;
       u2.stats[mode].draws++;
+      
       const rc1 = u1.ratings[mode][cat] - r1;
       const rc2 = u2.ratings[mode][cat] - r2;
+      const moveHistory = game.chess.history({ verbose: true });
       
-      // ✅ Store full match record with PGN
-      const matchRecord = {
+      // ✅ FULL MATCH RECORD WITH ANALYSIS
+      const matchRecord1 = {
         gameId,
         mode,
         cat,
@@ -460,22 +520,41 @@ function endGame(gameId, result, reason, winnerColor, loserColor) {
         opponent: u2.username,
         ratingChange: rc1,
         date: Date.now(),
+        color: 'w',
         pgn: generatePGN(game, 'draw'),
-        moves: game.chess.history({ verbose: true }),
+        moves: moveHistory.map((m) => ({
+          ...m,
+          eval: 0,
+          depth: 0,
+          bestEval: 0,
+          classification: 'Decent'
+        })),
+        analysis: {
+          total_moves: moveHistory.length,
+          accuracy: 50,
+          classifications: {
+            Best: 0, Good: 0, Decent: 0,
+            Inaccuracy: 0, Mistake: 0, Blunder: 0, Brilliant: 0
+          },
+          blunders: [],
+          brilliant_moves: []
+        },
+        notes: {}
       };
       
-      u1.matchHistory.push(matchRecord);
+      u1.matchHistory.push(matchRecord1);
       u2.matchHistory.push({
-        ...matchRecord,
+        ...matchRecord1,
         opponent: u1.username,
         ratingChange: rc2,
-        pgn: generatePGN(game, 'draw'),
+        color: 'b'
       });
       
-      // ✅ SAVE immediately after game ends
       saveData();
     }
-  } else if (winnerColor && loserColor) {
+  } 
+  // WIN/LOSS
+  else if (winnerColor && loserColor) {
     const winUN = game.usernames[winnerColor];
     const losUN = game.usernames[loserColor];
     const winner = winUN ? users[winUN] : null;
@@ -492,10 +571,12 @@ function endGame(gameId, result, reason, winnerColor, loserColor) {
       winner.winStreak = (winner.winStreak || 0) + 1;
       loser.winStreak = 0;
       winner.bestWinStreak = Math.max(winner.bestWinStreak || 0, winner.winStreak);
-      const rc = winner.ratings[mode][cat] - wr;
       
-      // ✅ Store full match record with PGN
-      winner.matchHistory.push({
+      const rc = winner.ratings[mode][cat] - wr;
+      const moveHistory = game.chess.history({ verbose: true });
+      
+      // ✅ FULL MATCH RECORD WITH ANALYSIS FOR WINNER
+      const matchRecordWinner = {
         gameId,
         mode,
         cat,
@@ -503,11 +584,30 @@ function endGame(gameId, result, reason, winnerColor, loserColor) {
         opponent: loser.username,
         ratingChange: rc,
         date: Date.now(),
+        color: winnerColor,
         pgn: generatePGN(game, 'win'),
-        moves: game.chess.history({ verbose: true }),
-      });
+        moves: moveHistory.map((m) => ({
+          ...m,
+          eval: 0,
+          depth: 0,
+          bestEval: 0,
+          classification: 'Decent'
+        })),
+        analysis: {
+          total_moves: moveHistory.length,
+          accuracy: 50,
+          classifications: {
+            Best: 0, Good: 0, Decent: 0,
+            Inaccuracy: 0, Mistake: 0, Blunder: 0, Brilliant: 0
+          },
+          blunders: [],
+          brilliant_moves: []
+        },
+        notes: {}
+      };
       
-      loser.matchHistory.push({
+      // ✅ FULL MATCH RECORD WITH ANALYSIS FOR LOSER
+      const matchRecordLoser = {
         gameId,
         mode,
         cat,
@@ -515,44 +615,36 @@ function endGame(gameId, result, reason, winnerColor, loserColor) {
         opponent: winner.username,
         ratingChange: -rc,
         date: Date.now(),
+        color: loserColor,
         pgn: generatePGN(game, 'loss'),
-        moves: game.chess.history({ verbose: true }),
-      });
+        moves: moveHistory.map((m) => ({
+          ...m,
+          eval: 0,
+          depth: 0,
+          bestEval: 0,
+          classification: 'Decent'
+        })),
+        analysis: {
+          total_moves: moveHistory.length,
+          accuracy: 50,
+          classifications: {
+            Best: 0, Good: 0, Decent: 0,
+            Inaccuracy: 0, Mistake: 0, Blunder: 0, Brilliant: 0
+          },
+          blunders: [],
+          brilliant_moves: []
+        },
+        notes: {}
+      };
       
-      // ✅ SAVE immediately after game ends
+      winner.matchHistory.push(matchRecordWinner);
+      loser.matchHistory.push(matchRecordLoser);
+      
       saveData();
     }
   }
 
   delete games[gameId];
-}
-
-// ✅ NEW: PGN generation for game export
-function generatePGN(game, result) {
-  const date = new Date();
-  const dateStr = date.toISOString().split('T')[0];
-  
-  let pgnResult = '*';
-  if (result === 'win') pgnResult = '1-0';
-  else if (result === 'loss') pgnResult = '0-1';
-  else if (result === 'draw') pgnResult = '1/2-1/2';
-  
-  const moves = game.chess.history({ verbose: true })
-    .map((m, i) => {
-      if (i % 2 === 0) return `${Math.floor(i/2) + 1}. ${m.san}`;
-      return m.san;
-    })
-    .join(' ');
-  
-  return `[Event "Phoenix Chess Game"]
-[Site "phoenix-chess.com"]
-[Date "${dateStr}"]
-[White "${game.usernames.w}"]
-[Black "${game.usernames.b}"]
-[Result "${pgnResult}"]
-[TimeControl "${game.timerSeconds}+${game.increment}"]
-
-${moves} ${pgnResult}`;
 }
 
 // ─── Socket.io ────────────────────────────────────────────────────────────
@@ -633,7 +725,9 @@ io.on('connection', (socket) => {
       } else if (isDraw) {
         endGame(gameId, 'Draw', 'Draw', null, null);
       }
-    } catch (e) { console.error(e); }
+    } catch (e) { 
+      console.error('Move error:', e); 
+    }
   });
 
   socket.on('resign', ({ gameId }) => {
@@ -644,11 +738,16 @@ io.on('connection', (socket) => {
     endGame(gameId, winner === 'w' ? 'White wins' : 'Black wins', 'Resignation', winner, loser);
   });
 
-  socket.on('offerDraw', ({ gameId }) => socket.to(gameId).emit('drawOffered'));
+  socket.on('offerDraw', ({ gameId }) => {
+    socket.to(gameId).emit('drawOffered');
+  });
 
   socket.on('respondDraw', ({ gameId, accept }) => {
-    if (accept) endGame(gameId, 'Draw', 'Draw agreement', null, null);
-    else socket.to(gameId).emit('drawDeclined');
+    if (accept) {
+      endGame(gameId, 'Draw', 'Draw agreement', null, null);
+    } else {
+      socket.to(gameId).emit('drawDeclined');
+    }
   });
 
   socket.on('cancelSearch', () => {
@@ -678,4 +777,5 @@ server.listen(PORT, () => {
   console.log(`🚀 Phoenix Chess Server running on port ${PORT}`);
   console.log(`💾 Data persisted to: ${DATA_FILE}`);
   console.log(`📊 Auto-save enabled every 30 seconds`);
+  console.log(`📈 Server started at ${new Date().toLocaleTimeString()}`);
 });
